@@ -65,8 +65,22 @@ function serializeDoc(d: FileDoc): string {
 /** The tree as the edits leave it: changed paths in `now` (null: deleted), the rest read from disk. */
 class Tree {
   private readonly orig = new Map<string, string | null>();
+  private readonly dirs = new Map<string, boolean>();
   readonly now = new Map<string, string | null>();
   readonly moves: [string, string][] = [];
+  /** True when a directory stands at `p` on disk: a create or move onto it is `exists`, not a write crash. */
+  isDir(p: string): boolean {
+    if (!this.dirs.has(p)) {
+      let d = false;
+      try {
+        d = statSync(p).isDirectory();
+      } catch {
+        d = false;
+      }
+      this.dirs.set(p, d);
+    }
+    return this.dirs.get(p)!;
+  }
   original(p: string): string | null {
     if (!this.orig.has(p)) {
       let v: string | null = null;
@@ -194,7 +208,7 @@ function jsonEdit(v: unknown): Edit | null {
     const text = o.file_text;
     return (tree) => {
       if (!safe(p)) throw new Fail('unsafe', p);
-      if (tree.get(p) !== null) throw new Fail('exists', p);
+      if (tree.get(p) !== null || tree.isDir(p)) throw new Fail('exists', p);
       tree.now.set(p, text);
     };
   }
@@ -321,6 +335,7 @@ interface UniSection {
   diffNew: string | null;
   headerOld: string | null;
   headerNew: string | null;
+  hasPair: boolean; // the header already holds a ---/+++ pair
   renameFrom: string | null;
   renameTo: string | null;
   newFile: boolean;
@@ -368,21 +383,23 @@ function parseUnified(lines: string[]): UniSection[] {
     if (line.startsWith('diff --git ')) {
       const m = /^diff --git a\/(\S+) b\/(\S+)$/.exec(line);
       if (m === null) throw new Exit2(`error: parse ${i + 1}`);
-      cur = { diffOld: m[1]!, diffNew: m[2]!, headerOld: null, headerNew: null, renameFrom: null, renameTo: null, newFile: false, deletedFile: false, hunks: [] };
+      cur = { diffOld: m[1]!, diffNew: m[2]!, headerOld: null, headerNew: null, hasPair: false, renameFrom: null, renameTo: null, newFile: false, deletedFile: false, hunks: [] };
       sections.push(cur);
       inHeader = true;
       i++;
       continue;
     }
     if (line.startsWith('--- ') && (lines[i + 1] ?? '').startsWith('+++ ')) {
-      if (cur !== null && inHeader) {
+      if (cur !== null && inHeader && !cur.hasPair) {
         // Part of this section's header, not a new section.
         cur.headerOld = uniPath(line.slice(4));
         cur.headerNew = uniPath(lines[i + 1]!.slice(4));
+        cur.hasPair = true;
         i += 2;
         continue;
       }
-      cur = { diffOld: null, diffNew: null, headerOld: uniPath(line.slice(4)), headerNew: uniPath(lines[i + 1]!.slice(4)), renameFrom: null, renameTo: null, newFile: false, deletedFile: false, hunks: [] };
+      // A second pair in a header is not part of that header: it starts a new section.
+      cur = { diffOld: null, diffNew: null, headerOld: uniPath(line.slice(4)), headerNew: uniPath(lines[i + 1]!.slice(4)), hasPair: true, renameFrom: null, renameTo: null, newFile: false, deletedFile: false, hunks: [] };
       sections.push(cur);
       inHeader = true;
       i += 2;
@@ -484,7 +501,7 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
       const newPath = newP === null ? '' : newP;
       if (isCreate) {
         if (!safe(newPath)) throw new Fail('unsafe', newPath);
-        if (tree.get(newPath) !== null) throw new Fail('exists', newPath);
+        if (tree.get(newPath) !== null || tree.isDir(newPath)) throw new Fail('exists', newPath);
         const plus: string[] = [];
         let noeol = false;
         for (const h of sec.hunks) {
@@ -511,7 +528,7 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
         if (!safe(newPath)) throw new Fail('unsafe', newPath);
         const before = tree.get(oldPath);
         if (before === null) throw new Fail('missing', oldPath);
-        if (tree.get(newPath) !== null) throw new Fail('exists', newPath);
+        if (tree.get(newPath) !== null || tree.isDir(newPath)) throw new Fail('exists', newPath);
         const doc = applyHunks(parseDoc(before), sec.hunks, strict, oldPath);
         tree.now.set(newPath, serializeDoc(doc));
         tree.now.set(oldPath, null);
@@ -574,7 +591,7 @@ function searchReplaceEdits(lines: string[], strict: boolean): Edit[] {
         return (tree: Tree) => {
           if (!safe(p)) throw new Fail('unsafe', p);
           if (o.length === 0) {
-            if (tree.get(p) !== null) throw new Fail('exists', p);
+            if (tree.get(p) !== null || tree.isDir(p)) throw new Fail('exists', p);
             tree.now.set(p, n.length === 0 ? '' : n.join('\n') + '\n');
             return;
           }
@@ -668,7 +685,7 @@ function v4aEdits(lines: string[], strict: boolean): Edit[] {
       edits.push(((p, fl) => {
         return (tree: Tree) => {
           if (!safe(p)) throw new Fail('unsafe', p);
-          if (tree.get(p) !== null) throw new Fail('exists', p);
+          if (tree.get(p) !== null || tree.isDir(p)) throw new Fail('exists', p);
           tree.now.set(p, fl.length === 0 ? '' : fl.join('\n') + '\n');
         };
       })(path, fileLines));
@@ -697,7 +714,9 @@ function v4aEdits(lines: string[], strict: boolean): Edit[] {
         const sl = lines[li]!;
         if (sl.startsWith('@@')) {
           if (curChunk !== null) chunks.push(curChunk);
-          curChunk = { anchor: sl.slice(2).trim(), hasAnchor: true, eof: false, body: [] };
+          // An empty anchor text is no anchor (section 8): do not search for an empty line.
+          const anchorText = sl.slice(2).trim();
+          curChunk = { anchor: anchorText === '' ? null : anchorText, hasAnchor: anchorText !== '', eof: false, body: [] };
           firstChunk = false;
           continue;
         }
@@ -730,7 +749,7 @@ function v4aEdits(lines: string[], strict: boolean): Edit[] {
           if (mt !== null && !safe(mt)) throw new Fail('unsafe', mt);
           const before = tree.get(p);
           if (before === null) throw new Fail('missing', p);
-          if (mt !== null && tree.get(mt) !== null) throw new Fail('exists', mt);
+          if (mt !== null && (tree.get(mt) !== null || tree.isDir(mt))) throw new Fail('exists', mt);
           const doc = parseDoc(before);
           let curLines = doc.lines.slice();
           let cursor = 0;
